@@ -68,6 +68,11 @@ class DepthHeadConfig:
     output_dim: int = 1
     output_size: int = 256
     use_gelu: bool = True
+    
+    # Depth extension flags for future v1
+    enable: bool = False  # Set to True in v1 to enable depth estimation
+    encoder_type: str = "depth_anything_v2"  # Future: depth_anything_v2, midas, etc.
+    use_depth_tokens: bool = False  # Future: inject depth features into LLM
 
 
 @dataclass
@@ -76,7 +81,7 @@ class LLMIntegrationConfig:
     
     llm_hidden_dim: int = 2048
     mask_token_proj_dim: int = 512
-    special_tokens: List[str] = field(default_factory=lambda: ["<SEG>", "<VIS_SUM>"])
+    special_tokens: List[str] = field(default_factory=lambda: ["<SEG>", "<VIS_SUM>", "<DEPTH>", "<DEPTH_SUM>"])
     use_lora: bool = True
     lora_rank: int = 8
     lora_alpha: int = 16
