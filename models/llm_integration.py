@@ -60,6 +60,9 @@ class LLMProjector(nn.Module):
             self.projection = nn.Sequential(*layers)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure consistent dtype
+        if hasattr(self.projection, 'weight'):
+            x = x.to(self.projection.weight.dtype)
         return self.projection(x)
 
 
@@ -222,12 +225,25 @@ class LLMIntegration(nn.Module):
         
         # Load base LLM
         logger.info(f"Loading LLM from {model_path}")
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+        try:
+            # Try loading with specific Qwen2.5-VL class
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            self.llm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            logger.info("Loaded with Qwen2_5_VLForConditionalGeneration")
+        except (ImportError, OSError) as e:
+            logger.warning(f"Failed to load with Qwen2_5_VLForConditionalGeneration: {e}")
+            # Fallback to AutoModel
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
         
         # Resize embeddings for new tokens
         self.llm = tokenizer.resize_model_embeddings(self.llm)
@@ -257,12 +273,7 @@ class LLMIntegration(nn.Module):
         
         # Depth token injector (for future v1.5)
         self.depth_injector = None
-        if config.depth_head and config.depth_head.use_depth_tokens:
-            self.depth_injector = VisionSummaryInjector(
-                vision_dim=config.mask_token_proj_dim,
-                llm_dim=config.llm_hidden_dim,
-                vis_sum_token_id=self.depth_sum_token_id,
-            )
+        # Depth configuration will be passed separately when needed
         
         logger.info("LLM integration initialized")
     

@@ -65,11 +65,12 @@ class LISAModel(nn.Module):
         
         self.mask_decoder = MaskDecoder(config.sam_decoder)
         
-        # Depth Head (dummy in v0, real in v1)
+        # Depth Head (disabled in v0, enabled in v1)
+        self.depth_enabled = config.depth_head is not None and config.depth_head.enable
         if config.depth_head is not None:
             self.depth_head = DepthHead(config.depth_head)
         else:
-            self.depth_head = nn.Identity()
+            self.depth_head = None
         
         # LLM Integration
         self.llm_integration = LLMIntegration(
@@ -152,12 +153,18 @@ class LISAModel(nn.Module):
                 - mask_tokens: Mask token embeddings (B, K, C)
         """
         # Encode prompts
-        sparse_embeddings, dense_embeddings = self.prompt_encoder(
-            points=points,
-            boxes=boxes,
-            masks=masks,
-            text_embeddings=prompt_embeddings,
-        )
+        # For text embeddings from LLM, they are already projected to the right dimension
+        if prompt_embeddings is not None:
+            # Use prompt embeddings directly as sparse embeddings
+            sparse_embeddings = prompt_embeddings
+            dense_embeddings = None
+        else:
+            # Use regular prompt encoder for other prompt types
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points=points,
+                boxes=boxes,
+                masks=masks,
+            )
         
         # Adapt prompt embeddings to mask decoder dimension
         sparse_embeddings = self.prompt_adapter(sparse_embeddings)
@@ -213,11 +220,18 @@ class LISAModel(nn.Module):
         # Use global average pooling of mask tokens as summary
         vision_summary = image_embeddings.mean(dim=[2, 3])  # (B, 512)
         
-        # Estimate depth (dummy in v0)
-        depth_pred = self.depth_head(image_embeddings)
+        # Estimate depth (only if enabled)
+        depth_pred = None
         depth_summary = None
-        if self.config.depth_head and self.config.depth_head.use_depth_tokens:
-            depth_summary = depth_pred.mean(dim=[2, 3])  # (B, 512)
+        if self.depth_enabled and self.depth_head is not None:
+            try:
+                depth_pred = self.depth_head(image_embeddings)
+                if self.config.depth_head.use_depth_tokens:
+                    depth_summary = depth_pred.mean(dim=[2, 3])  # (B, 512)
+            except RuntimeError as e:
+                # Depth estimation disabled or failed
+                logger.warning(f"Depth estimation skipped: {e}")
+                depth_pred = None
         
         # LLM forward pass
         llm_outputs = self.llm_integration(
@@ -231,8 +245,11 @@ class LISAModel(nn.Module):
         # Initialize outputs
         outputs = {
             "logits": llm_outputs["logits"],
-            "depth": depth_pred,
         }
+        
+        # Only include depth if computed
+        if depth_pred is not None:
+            outputs["depth"] = depth_pred
         
         total_loss = 0.0
         
@@ -243,9 +260,29 @@ class LISAModel(nn.Module):
         
         # Generate masks if <SEG> tokens present
         if llm_outputs.get("seg_prompts") is not None:
+            # Batch seg_prompts by batch index
+            seg_prompts = llm_outputs["seg_prompts"]
+            seg_positions = llm_outputs["seg_positions"]
+            
+            # For simplicity, take the first <SEG> token per batch
+            # In practice, you'd handle multiple <SEG> tokens per batch
+            B = image_embeddings.shape[0]
+            batched_prompts = []
+            
+            for b in range(B):
+                batch_mask = seg_positions[:, 0] == b
+                if batch_mask.any():
+                    # Take first <SEG> for this batch
+                    batched_prompts.append(seg_prompts[batch_mask][0:1])
+                else:
+                    # No <SEG> token for this batch, use zero embedding
+                    batched_prompts.append(torch.zeros(1, seg_prompts.shape[-1], device=seg_prompts.device, dtype=seg_prompts.dtype))
+            
+            batched_prompts = torch.stack(batched_prompts)  # (B, 1, C)
+            
             mask_outputs = self.generate_masks(
                 image_embeddings=image_embeddings,
-                prompt_embeddings=llm_outputs["seg_prompts"],
+                prompt_embeddings=batched_prompts,
                 points=points,
                 boxes=boxes,
                 masks=masks,
@@ -271,11 +308,15 @@ class LISAModel(nn.Module):
                 total_loss += self.loss_weights["mask"] * mask_loss
                 total_loss += self.loss_weights["iou"] * iou_loss
         
-        # Depth loss
-        if gt_depths is not None:
-            depth_loss = compute_depth_loss(depth_pred, gt_depths)
-            outputs["loss_depth"] = depth_loss
-            total_loss += self.loss_weights["depth"] * depth_loss
+        # Depth loss (only if depth is enabled and predicted)
+        if gt_depths is not None and depth_pred is not None:
+            try:
+                depth_loss = compute_depth_loss(depth_pred, gt_depths)
+                outputs["loss_depth"] = depth_loss
+                total_loss += self.loss_weights["depth"] * depth_loss
+            except ValueError as e:
+                logger.error(f"Depth loss computation failed: {e}")
+                # Continue without depth loss
         
         # Total loss
         if total_loss > 0:

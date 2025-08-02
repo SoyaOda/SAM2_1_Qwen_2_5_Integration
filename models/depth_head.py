@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 
 class DepthHeadDummy(nn.Module):
     """
-    Dummy depth head for v0 - returns zero tensors.
+    Placeholder depth head for v0.
     
-    This will be replaced with actual depth estimation in v1.
+    This implementation raises an error when depth estimation is attempted
+    while disabled, ensuring no silent failures.
     """
     
     def __init__(self, config: DepthHeadConfig):
@@ -29,27 +30,35 @@ class DepthHeadDummy(nn.Module):
         self.config = config
         self.output_size = config.output_size
         
-        logger.info("Initialized DepthHeadDummy (v0) - depth estimation disabled")
+        if not config.enable:
+            logger.warning(
+                "DepthHead initialized with enable=False. "
+                "Depth estimation will not be available. "
+                "Set config.depth_head.enable=True to enable depth estimation."
+            )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Return zero depth map.
+        Depth estimation placeholder.
         
         Args:
             x: Image features (B, C, H, W)
             
         Returns:
-            Zero depth map (B, 1, output_size, output_size)
+            Empty depth map or raises error
+            
+        Raises:
+            RuntimeError: When depth estimation is disabled
         """
-        B = x.shape[0]
-        device = x.device
-        dtype = x.dtype
+        if not self.config.enable:
+            raise RuntimeError(
+                "Depth estimation is disabled. "
+                "Set config.depth_head.enable=True and use DepthHeadReal "
+                "to enable depth estimation functionality."
+            )
         
-        # Return zeros with correct shape
-        return torch.zeros(
-            B, 1, self.output_size, self.output_size,
-            device=device, dtype=dtype
-        )
+        # Should not reach here
+        raise NotImplementedError("DepthHeadDummy should not be used with enable=True")
 
 
 class DepthHead(nn.Module):
@@ -236,10 +245,21 @@ def compute_depth_loss(
         
     Returns:
         Depth loss value
+        
+    Raises:
+        ValueError: If target is None or invalid
     """
-    # For v0, always return 0
-    if target is None or torch.all(target == 0):
-        return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+    # Validate inputs
+    if target is None:
+        raise ValueError(
+            "Ground truth depth map is required for depth loss computation. "
+            "If depth estimation is not needed, exclude depth loss from training."
+        )
+    
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"Shape mismatch: pred {pred.shape} vs target {target.shape}"
+        )
     
     # Apply valid mask if provided
     if valid_mask is not None:

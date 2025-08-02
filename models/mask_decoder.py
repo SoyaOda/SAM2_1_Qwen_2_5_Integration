@@ -74,15 +74,8 @@ class TwoWayTransformer(nn.Module):
             queries: Processed prompt embeddings (B, N, C)
             keys: Processed image features (B, H*W, C)
         """
-        # BxHWxC -> BxCxHW -> HWxBxC
-        bs, hw, c = image_embedding.shape
-        image_embedding = image_embedding.transpose(1, 2).reshape(bs, c, -1)
-        image_embedding = image_embedding.permute(2, 0, 1)
-        
-        image_pe = image_pe.transpose(1, 2).reshape(bs, c, -1)
-        image_pe = image_pe.permute(2, 0, 1)
-        
-        # Prepare queries
+        # Input shapes are already correct: (B, H*W, C) and (B, N, C)
+        # No need to reshape - SAM2 keeps them as sequences
         queries = point_embedding
         keys = image_embedding
         
@@ -99,7 +92,7 @@ class TwoWayTransformer(nn.Module):
         q = queries + point_embedding
         k = keys + image_pe
         
-        attn_out = self.final_attn_token_to_image(q, k)
+        attn_out = self.final_attn_token_to_image(q, k, keys)
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
         
@@ -403,7 +396,10 @@ class MaskDecoder(nn.Module):
         
         # Reshape and create positional encoding
         image_embeddings_reshaped = image_embeddings.flatten(2).permute(0, 2, 1)
-        image_pe = self.pe_layer((H, W)).unsqueeze(0)
+        # pe_layer returns (C, H, W) where C = 2 * num_pos_feats
+        image_pe = self.pe_layer((H, W)).to(image_embeddings.device)
+        # Add batch dimension and reshape to match image embeddings
+        image_pe = image_pe.unsqueeze(0).expand(B, -1, -1, -1)
         image_pe = image_pe.flatten(2).permute(0, 2, 1)
         
         # Pass through transformer
@@ -485,13 +481,21 @@ class PositionEmbeddingRandom(nn.Module):
         """Generate positional encoding for given size."""
         h, w = size
         device = self.positional_encoding_gaussian_matrix.device
-        grid = torch.stack([
-            torch.arange(w, device=device) / (w - 1) * 2 - 1,
-            torch.arange(h, device=device) / (h - 1) * 2 - 1,
-        ], dim=-1)
+        # Create grid of normalized coordinates
+        y_embed = torch.arange(h, device=device).float() / (h - 1) * 2 - 1
+        x_embed = torch.arange(w, device=device).float() / (w - 1) * 2 - 1
+        
+        # Create meshgrid
+        y_embed = y_embed.unsqueeze(1).repeat(1, w)
+        x_embed = x_embed.unsqueeze(0).repeat(h, 1)
+        
+        # Stack to create (h, w, 2) grid
+        grid = torch.stack([x_embed, y_embed], dim=-1)
         grid = grid.reshape(h * w, 2)
         
         # Project to frequency space
+        # Ensure same dtype as the gaussian matrix
+        grid = grid.to(self.positional_encoding_gaussian_matrix.dtype)
         pos_embed = grid @ self.positional_encoding_gaussian_matrix
         pos_embed = 2 * torch.pi * pos_embed
         
